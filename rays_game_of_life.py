@@ -3,10 +3,18 @@ import pycuda.driver as cuda
 from pycuda.compiler import SourceModule
 import numpy as np
 import pygame
+import math
 
-# CUDA kernel for Game of Life with brightness
+# CUDA kernel for Game of Life with invisible ray lighting
 cuda_code = """
-__global__ void game_of_life(unsigned char *grid, unsigned char *next_grid, unsigned char *brightness, int width, int height)
+#define MAX_RAY_LENGTH 2000  // Will be set dynamically in Python
+
+__device__ float2 directions[] = {
+    {1, 0}, {-1, 0}, {0, 1}, {0, -1},
+    {0.707f, 0.707f}, {-0.707f, 0.707f}, {0.707f, -0.707f}, {-0.707f, -0.707f}
+};
+
+__global__ void game_of_life(unsigned char *grid, unsigned char *next_grid, int width, int height)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -16,7 +24,6 @@ __global__ void game_of_life(unsigned char *grid, unsigned char *next_grid, unsi
     int idx = y * width + x;
     int alive_neighbors = 0;
 
-    #pragma unroll
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             if (dx == 0 && dy == 0) continue;
@@ -29,12 +36,43 @@ __global__ void game_of_life(unsigned char *grid, unsigned char *next_grid, unsi
     unsigned char cell = grid[idx];
     next_grid[idx] = (cell == 1 && (alive_neighbors == 2 || alive_neighbors == 3)) || 
                      (cell == 0 && alive_neighbors == 3);
-    
-    // Calculate brightness based on number of live neighbors
-    brightness[idx] = (unsigned char)(alive_neighbors * 28);  // 28 * 9 = 252, max brightness
 }
 
-__global__ void update_texture(unsigned char *grid, unsigned char *brightness, unsigned int *texture, int width, int height)
+__global__ void raycast(unsigned char *grid, float *light_intensity, int width, int height, int max_ray_length)
+{
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    if (x >= width || y >= height) return;
+    
+    // Only process border cells
+    if (x > 0 && x < width-1 && y > 0 && y < height-1) return;
+    
+    for (int d = 0; d < 8; d++) {
+        float2 dir = directions[d];
+        float px = x + 0.5f, py = y + 0.5f;
+        
+        for (int step = 0; step < max_ray_length; step++) {
+            px += dir.x;
+            py += dir.y;
+            
+            int nx = (int)px;
+            int ny = (int)py;
+            
+            if (nx < 0 || nx >= width || ny < 0 || ny >= height) break;
+            
+            int idx = ny * width + nx;
+            float distance = sqrtf((px - x)*(px - x) + (py - y)*(py - y));
+            float intensity = 1.0f / (1.0f + 0.005f * distance);  // Adjusted for slower falloff
+            
+            atomicAdd(&light_intensity[idx], intensity);
+            
+            if (grid[idx] == 1) break;  // Ray hits a live cell and stops
+        }
+    }
+}
+
+__global__ void update_texture(unsigned char *grid, float *light_intensity, unsigned int *texture, int width, int height)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -43,16 +81,18 @@ __global__ void update_texture(unsigned char *grid, unsigned char *brightness, u
     
     int idx = y * width + x;
     unsigned char cell = grid[idx];
-    unsigned char cell_brightness = brightness[idx];
+    float intensity = min(light_intensity[idx], 1.0f);
     
-    if (cell) {
-        // Live cell: use calculated brightness
-        texture[idx] = 0xFF000000 | (cell_brightness << 16) | (cell_brightness << 8) | cell_brightness;
+    if (cell && intensity > 0.05f) {  // Only render live cells with significant light
+        unsigned char color_value = (unsigned char)(255 * intensity);
+        texture[idx] = 0xFF000000 | (color_value << 16) | (color_value << 8) | color_value;
     } else {
-        // Dead cell: dim glow based on neighbor activity
-        unsigned char glow = cell_brightness >> 2;  // Divide by 4 for a subtle glow
-        texture[idx] = 0xFF000000 | (glow << 16) | (glow << 8) | glow;
+        // Everything else is black
+        texture[idx] = 0xFF000000;
     }
+    
+    // Reset light intensity for next frame
+    light_intensity[idx] = 0.0f;
 }
 """
 
@@ -63,22 +103,26 @@ width, height = screen_info.current_w, screen_info.current_h
 screen = pygame.display.set_mode(
     (width, height), pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF
 )
-pygame.display.set_caption("Game of Life - Brightness by Activity")
+pygame.display.set_caption("Game of Life - Invisible Ray Border Lighting")
+
+# Calculate max ray length
+max_ray_length = int(math.sqrt(width**2 + height**2))
 
 # Compile CUDA kernel
-mod = SourceModule(cuda_code)
+mod = SourceModule(cuda_code.replace('MAX_RAY_LENGTH 2000', f'MAX_RAY_LENGTH {max_ray_length}'))
 game_of_life_kernel = mod.get_function("game_of_life")
+raycast_kernel = mod.get_function("raycast")
 update_texture_kernel = mod.get_function("update_texture")
 
 # Initialize grids
 grid = np.random.choice([0, 1], size=(height, width), p=[0.85, 0.15]).astype(np.uint8)
 next_grid = np.zeros((height, width), dtype=np.uint8)
-brightness = np.zeros((height, width), dtype=np.uint8)
+light_intensity = np.zeros((height, width), dtype=np.float32)
 
 # Allocate memory on GPU
 grid_gpu = cuda.mem_alloc(grid.nbytes)
 next_grid_gpu = cuda.mem_alloc(next_grid.nbytes)
-brightness_gpu = cuda.mem_alloc(brightness.nbytes)
+light_intensity_gpu = cuda.mem_alloc(light_intensity.nbytes)
 
 # Create texture for rendering
 texture = np.zeros((height, width), dtype=np.uint32)
@@ -107,7 +151,7 @@ while running:
             if event.key == pygame.K_SPACE:
                 paused = not paused
             elif event.key == pygame.K_r:
-                prob = np.random.uniform(0.01, 0.35)
+                prob = np.random.uniform(0.0, 1.0)
                 grid = np.random.choice([0, 1], size=(height, width), p=[1 - prob, prob]).astype(
                     np.uint8
                 )
@@ -116,11 +160,10 @@ while running:
                 running = False
 
     if not paused:
-        # Run CUDA kernels
+        # Run Game of Life update
         game_of_life_kernel(
             grid_gpu,
             next_grid_gpu,
-            brightness_gpu,
             np.int32(width),
             np.int32(height),
             block=block_size,
@@ -130,10 +173,21 @@ while running:
         # Swap grid pointers
         grid_gpu, next_grid_gpu = next_grid_gpu, grid_gpu
 
+    # Perform raycasting
+    raycast_kernel(
+        grid_gpu,
+        light_intensity_gpu,
+        np.int32(width),
+        np.int32(height),
+        np.int32(max_ray_length),
+        block=block_size,
+        grid=grid_size,
+    )
+
     # Update texture
     update_texture_kernel(
         grid_gpu,
-        brightness_gpu,
+        light_intensity_gpu,
         texture_gpu,
         np.int32(width),
         np.int32(height),
@@ -151,7 +205,7 @@ while running:
 
     # Calculate and display FPS
     fps = clock.get_fps()
-    pygame.display.set_caption(f"Game of Life - Brightness by Activity (FPS: {fps:.2f})")
+    pygame.display.set_caption(f"Game of Life - Invisible Ray Border Lighting (FPS: {fps:.2f})")
     clock.tick()
 
 pygame.quit()

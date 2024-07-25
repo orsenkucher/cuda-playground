@@ -4,9 +4,38 @@ from pycuda.compiler import SourceModule
 import numpy as np
 import pygame
 
-# CUDA kernel for Game of Life with brightness
+# CUDA kernel for Game of Life with brightness, attractors, and repellers
 cuda_code = """
-__global__ void game_of_life(unsigned char *grid, unsigned char *next_grid, unsigned char *brightness, int width, int height)
+#define MAX_FORCES 20
+
+struct Force {
+    float x;
+    float y;
+    float strength;
+};
+
+__device__ float2 calculate_force(int x, int y, Force* forces, int num_forces, float max_distance)
+{
+    float2 total_force = make_float2(0.0f, 0.0f);
+    
+    for (int i = 0; i < num_forces; i++) {
+        float dx = forces[i].x - x;
+        float dy = forces[i].y - y;
+        float distance = sqrtf(dx*dx + dy*dy);
+        
+        if (distance < max_distance) {
+            float force_magnitude = forces[i].strength * (1.0f - distance / max_distance);
+            total_force.x += force_magnitude * dx / distance;
+            total_force.y += force_magnitude * dy / distance;
+        }
+    }
+    
+    return total_force;
+}
+
+__global__ void game_of_life(unsigned char *grid, unsigned char *next_grid, unsigned char *brightness,
+                             Force* forces, int num_forces,
+                             int width, int height)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
@@ -16,12 +45,16 @@ __global__ void game_of_life(unsigned char *grid, unsigned char *next_grid, unsi
     int idx = y * width + x;
     int alive_neighbors = 0;
 
-    #pragma unroll
+    // Calculate forces
+    float max_distance = 150.0f;
+    float2 total_force = calculate_force(x, y, forces, num_forces, max_distance);
+    
+    // Apply forces to neighbor calculation
     for (int dy = -1; dy <= 1; dy++) {
         for (int dx = -1; dx <= 1; dx++) {
             if (dx == 0 && dy == 0) continue;
-            int nx = (x + dx + width) % width;
-            int ny = (y + dy + height) % height;
+            int nx = (int)(x + dx + total_force.x + width) % width;
+            int ny = (int)(y + dy + total_force.y + height) % height;
             alive_neighbors += grid[ny * width + nx];
         }
     }
@@ -30,8 +63,9 @@ __global__ void game_of_life(unsigned char *grid, unsigned char *next_grid, unsi
     next_grid[idx] = (cell == 1 && (alive_neighbors == 2 || alive_neighbors == 3)) || 
                      (cell == 0 && alive_neighbors == 3);
     
-    // Calculate brightness based on number of live neighbors
-    brightness[idx] = (unsigned char)(alive_neighbors * 28);  // 28 * 9 = 252, max brightness
+    // Calculate brightness based on number of live neighbors and force magnitude
+    float force_magnitude = sqrtf(total_force.x * total_force.x + total_force.y * total_force.y);
+    brightness[idx] = (unsigned char)(alive_neighbors * 28 + force_magnitude * 50);
 }
 
 __global__ void update_texture(unsigned char *grid, unsigned char *brightness, unsigned int *texture, int width, int height)
@@ -63,7 +97,7 @@ width, height = screen_info.current_w, screen_info.current_h
 screen = pygame.display.set_mode(
     (width, height), pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF
 )
-pygame.display.set_caption("Game of Life - Brightness by Activity")
+pygame.display.set_caption("Game of Life - With Attractors and Repellers")
 
 # Compile CUDA kernel
 mod = SourceModule(cuda_code)
@@ -91,6 +125,14 @@ grid_size = (
     (height + block_size[1] - 1) // block_size[1],
 )
 
+# Initialize forces (attractors and repellers)
+forces = []
+
+# Allocate memory for forces on GPU
+max_forces = 20
+force_dtype = np.dtype([('x', np.float32), ('y', np.float32), ('strength', np.float32)])
+forces_gpu = cuda.mem_alloc(max_forces * force_dtype.itemsize)
+
 # Main loop
 running = True
 paused = False
@@ -114,13 +156,27 @@ while running:
                 cuda.memcpy_htod(grid_gpu, grid)
             elif event.key == pygame.K_ESCAPE:
                 running = False
+        elif event.type == pygame.MOUSEBUTTONDOWN:
+            x, y = pygame.mouse.get_pos()
+            if event.button == 1:  # Left click
+                forces.append((x, y, 1.0))
+            elif event.button == 3:  # Right click
+                forces.append((x, y, -1.0))
+            forces = forces[-max_forces:]  # Keep only the last max_forces
 
     if not paused:
+        # Update forces on GPU
+        forces_array = np.array(forces, dtype=force_dtype)
+        if len(forces_array) > 0:
+            cuda.memcpy_htod(forces_gpu, forces_array)
+
         # Run CUDA kernels
         game_of_life_kernel(
             grid_gpu,
             next_grid_gpu,
             brightness_gpu,
+            forces_gpu,
+            np.int32(len(forces)),
             np.int32(width),
             np.int32(height),
             block=block_size,
@@ -147,11 +203,17 @@ while running:
     # Update Pygame surface and display
     surface = pygame.surfarray.make_surface(texture.transpose(1, 0))
     screen.blit(surface, (0, 0))
+
+    # Draw forces (attractors and repellers)
+    for force in forces:
+        color = (0, 255, 0) if force[2] > 0 else (255, 0, 0)
+        pygame.draw.circle(screen, color, (int(force[0]), int(force[1])), 5)
+
     pygame.display.flip()
 
     # Calculate and display FPS
     fps = clock.get_fps()
-    pygame.display.set_caption(f"Game of Life - Brightness by Activity (FPS: {fps:.2f})")
+    pygame.display.set_caption(f"Game of Life - With Attractors and Repellers (FPS: {fps:.2f})")
     clock.tick()
 
 pygame.quit()
